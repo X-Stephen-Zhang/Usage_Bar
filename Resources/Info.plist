@@ -4,34 +4,27 @@
 <dict>
     <key>CFBundleDevelopmentRegion</key>
     <string>en</string>
-    <key>CFBundleLocalizations</key>
-    <array>
-        <string>en</string>
-        <string>ja</string>
-    </array>
     <key>CFBundleDisplayName</key>
-    <string>Codex Usage App</string>
+    <string>Usage Bar</string>
     <key>CFBundleExecutable</key>
-    <string>CodexUsageMenuBar</string>
+    <string>UsageBar</string>
     <key>CFBundleIdentifier</key>
-    <string>jp.codex.usage-menubar</string>
+    <string>local.usage-bar</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>CFBundleName</key>
-    <string>Codex Usage</string>
+    <string>Usage Bar</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.7.1</string>
+    <string>2.0.0</string>
     <key>CFBundleVersion</key>
-    <string>16</string>
+    <string>18</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>LSUIElement</key>
     <true/>
-    <key>NSHumanReadableCopyright</key>
-    <string>Created for local Codex usage monitoring</string>
 </dict>
 </plist>

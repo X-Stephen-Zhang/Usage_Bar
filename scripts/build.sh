@@ -2,64 +2,31 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BUILD_DIR="${BUILD_DIR:-$ROOT_DIR/build}"
-APP_NAME="Codex Usage.app"
-APP_DIR="$BUILD_DIR/$APP_NAME"
-SOURCE="$ROOT_DIR/Sources/CodexUsageMenuBar.swift"
-PLIST="$ROOT_DIR/Resources/Info.plist"
-ICON="$ROOT_DIR/Resources/AppIcon.icns"
-MIN_MACOS="${MIN_MACOS:-13.0}"
-ARCHS="${ARCHS:-native}"
+BUILD_DIR="$ROOT_DIR/build"
+APP_DIR="$BUILD_DIR/Usage Bar.app"
 
-mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources" "$BUILD_DIR/objects"
+mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
 
-compile_arch() {
-  local arch="$1"
-  local output="$BUILD_DIR/objects/CodexUsageMenuBar-$arch"
-  swiftc \
-    -O \
-    -parse-as-library \
-    -target "$arch-apple-macos$MIN_MACOS" \
-    -framework AppKit \
-    -framework ServiceManagement \
-    "$SOURCE" \
-    -o "$output"
-}
+swiftc \
+  -O \
+  -module-cache-path "$BUILD_DIR/ModuleCache" \
+  -parse-as-library \
+  -target "$(uname -m)-apple-macos13.0" \
+  -framework AppKit \
+  -framework SwiftUI \
+  "$ROOT_DIR"/Sources/*.swift \
+  -o "$APP_DIR/Contents/MacOS/UsageBar"
 
-if [[ "$ARCHS" == "universal" ]]; then
-  compile_arch arm64
-  compile_arch x86_64
-  lipo -create \
-    "$BUILD_DIR/objects/CodexUsageMenuBar-arm64" \
-    "$BUILD_DIR/objects/CodexUsageMenuBar-x86_64" \
-    -output "$APP_DIR/Contents/MacOS/CodexUsageMenuBar"
-elif [[ "$ARCHS" == "native" ]]; then
-  native_arch="$(uname -m)"
-  compile_arch "$native_arch"
-  cp "$BUILD_DIR/objects/CodexUsageMenuBar-$native_arch" \
-    "$APP_DIR/Contents/MacOS/CodexUsageMenuBar"
+cp "$ROOT_DIR/Resources/Info.plist" "$APP_DIR/Contents/Info.plist"
+cp "$ROOT_DIR/Resources/AppIcon.icns" "$APP_DIR/Contents/Resources/AppIcon.icns"
+# A stable certificate keeps the keychain "Always Allow" grant valid across rebuilds.
+SIGN_IDENTITY="${SIGN_IDENTITY:-Usage Bar Signing}"
+if security find-certificate -c "$SIGN_IDENTITY" >/dev/null 2>&1; then
+  codesign --force --sign "$SIGN_IDENTITY" "$APP_DIR"
 else
-  compile_arch "$ARCHS"
-  cp "$BUILD_DIR/objects/CodexUsageMenuBar-$ARCHS" \
-    "$APP_DIR/Contents/MacOS/CodexUsageMenuBar"
+  echo "warning: certificate \"$SIGN_IDENTITY\" not found; using ad-hoc signing" >&2
+  codesign --force --sign - "$APP_DIR"
 fi
-
-cp "$PLIST" "$APP_DIR/Contents/Info.plist"
-cp "$ICON" "$APP_DIR/Contents/Resources/AppIcon.icns"
-for localization in "$ROOT_DIR"/Resources/*.lproj; do
-  cp -R "$localization" "$APP_DIR/Contents/Resources/"
-done
-codesign --force --deep --sign - "$APP_DIR"
-plutil -lint "$APP_DIR/Contents/Info.plist"
-codesign --verify --deep --strict "$APP_DIR"
-
-if [[ "${PACKAGE:-0}" == "1" ]]; then
-  ditto -c -k --sequesterRsrc --keepParent "$APP_DIR" "$BUILD_DIR/Codex-Usage-App.zip"
-  echo "Created $BUILD_DIR/Codex-Usage-App.zip"
-fi
-
-if [[ "${DMG:-0}" == "1" ]]; then
-  "$ROOT_DIR/scripts/package-dmg.sh"
-fi
+codesign --verify --strict "$APP_DIR"
 
 echo "Built $APP_DIR"

@@ -1,125 +1,75 @@
-# Codex Usage App
+# Usage Bar
 
 <p align="center">
-  <img src="Resources/AppIcon.svg" width="128" alt="Codex Usage App icon">
+  <img src="Resources/AppIcon.svg" width="112" alt="Usage Bar icon">
 </p>
 
-An unofficial, open-source macOS menu bar utility that shows the remaining
-total Codex limit plus consumption observed today. It also shows the 5-hour
-limit when Codex returns one.
+A small macOS menu bar app that shows how much **Codex** and **Claude** quota you have left, side by side.
 
-[日本語 README](README.ja.md)
+```
+X 60% A 35%|66%
+```
+
+- **X**: Codex weekly remaining
+- **A**: Claude 5-hour remaining | Claude weekly remaining
+
+Click it for a dashboard with rings, reset times, your plans, and a green **Daily avg** ring
+(weekly remaining ÷ days until reset, at least one day). The dashboard can also be pinned to the desktop.
+
+No passwords, no keychain prompts, and no network requests of its own.
 
 <p align="center">
-  <a href="https://github.com/estay-inc/codex-usage-app/releases/latest/download/Codex-Usage-App.dmg"><strong>Download for macOS (.dmg)</strong></a>
+  <img src="docs/images/menu-bar.png" width="360" alt="Menu bar item">
+  <br>
+  <img src="docs/images/dashboard.png" width="360" alt="Usage dashboard">
 </p>
 
 ![macOS](https://img.shields.io/badge/macOS-13%2B-black)
 ![Swift](https://img.shields.io/badge/Swift-6-orange)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
-## What it does
+## Where the data comes from
 
-- Shows the remaining total limit (`T`) and consumption today (`D`) in the
-  menu bar.
-- Shows the remaining 5-hour limit (`5h`) only when it is available.
-- Displays used percentage, reset time, plan, and last update time.
-- Refreshes automatically every two minutes.
-- Supports launching at login through macOS `SMAppService`.
-- Switches the app UI automatically between English and Japanese based on the
-  macOS language setting.
-- Keeps up to 48 hours of usage history locally; there is no analytics or
-  developer-operated backend.
+- **Codex**: the app starts the Codex CLI's local `codex app-server` and calls `account/rateLimits/read`.
+  The CLI uses its own sign-in.
+- **Claude (auto refresh)**: if the Claude Code CLI is installed and signed in (`claude auth login`),
+  the app runs `claude -p /usage` at launch, on Refresh and every 5 minutes. `/usage` is a local
+  command: it does not call the model or use quota, and the CLI uses its own sign-in.
+- **Claude (status line, optional)**: Claude Code passes `rate_limits` to its
+  [status line](https://code.claude.com/docs/en/statusline#rate-limit-usage) command. Clicking
+  **Connect Claude Code** sets the status line to `UsageBar --statusline`, which saves those numbers to
+  `~/Library/Application Support/Usage Bar/claude-rate-limits.json` and the app reads that file.
+  An existing status line keeps working: Usage Bar runs it and shows its output.
 
-## In the menu bar
+Claude numbers update whenever Claude Code receives a reply. The card shows when they were last seen;
+once a window's reset time passes it shows as fully available. `rate_limits` is only provided for
+Claude Pro and Max subscriptions.
 
-<p align="center">
-  <img src="docs/images/usage-details.png" width="255" alt="Codex Usage App usage details menu">
-</p>
+To undo the status line change:
 
-- `T 82%` means 82% of the total limit remains.
-- `D 6%` means 6% of the total limit has been observed as used today.
-- Without a reliable midnight baseline, daily tracking starts at `D 0%` and
-  shows the usage observed after the app starts.
-- The normal title is `T 82%  D 6%`. When a 5-hour window is available, it
-  looks like `5h 70%  T 82%  D 6%`.
-- Click the status item to see used percentages, reset times, your plan, and
-  the last update time.
-
-## Requirements
-
-- macOS 13 or later.
-- Apple Silicon or Intel Mac.
-- One of the following installed and signed in:
-  - ChatGPT/Codex desktop app, or
-  - Codex CLI.
-
-The app talks to the local [Codex App Server](https://learn.chatgpt.com/docs/app-server)
-and calls the documented `account/rateLimits/read` method. It never reads or
-stores your ChatGPT tokens itself.
-
-## Install a release
-
-1. Download and open [Codex-Usage-App.dmg](https://github.com/estay-inc/codex-usage-app/releases/latest/download/Codex-Usage-App.dmg).
-2. Open the DMG, then open `Codex Usage.app`.
-3. Click **Move and Open** when the app asks to move itself to `/Applications`.
-4. If macOS blocks an unsigned community build, Control-click the app in Finder
-   and choose **Open** once.
-5. Optionally enable **Launch at Login** from the menu.
-
-Community release builds are ad-hoc signed, not Apple-notarized.
-
-## Build from source
-
-Xcode is not required; the Swift toolchain included with Xcode Command Line
-Tools is sufficient.
-
-```bash
-git clone https://github.com/estay-inc/codex-usage-app.git
-cd codex-usage-app
-./scripts/build.sh
-open "build/Codex Usage.app"
+```sh
+"/Applications/Usage Bar.app/Contents/MacOS/UsageBar" --disconnect-claude
 ```
 
-Create a universal binary and ZIP package:
+## Build
 
-```bash
-ARCHS=universal PACKAGE=1 ./scripts/build.sh
+Requires macOS 13+ and the Xcode command line tools.
+
+```sh
+bash scripts/test.sh
+ditto "build/Usage Bar.app" "/Applications/Usage Bar.app"
 ```
 
-Create the DMG used for GitHub Releases:
+`scripts/build.sh` signs with a code-signing certificate named `Usage Bar Signing` when one exists,
+otherwise ad-hoc.
 
-```bash
-ARCHS=universal DMG=1 ./scripts/build.sh
-```
+## Credits
 
-Run the live usage test on a Mac already signed in to Codex:
+Usage Bar started from [estay-inc/codex-usage-app](https://github.com/estay-inc/codex-usage-app)
+(MIT), a Codex-only menu bar utility. This version adds Claude Code support, the combined menu bar
+title, the Daily avg ring and the pinnable dashboard, and drops the localization and DMG packaging.
+The original commit history is kept in this repository.
 
-```bash
-CODEX_USAGE_LIVE_TEST=1 ./scripts/test.sh
-```
+## License
 
-If Codex is installed in a custom location, set `CODEX_PATH` to the absolute
-path of the executable before launching the app.
-
-## Privacy
-
-See [PRIVACY.md](PRIVACY.md). To calculate daily consumption, the app keeps
-only the last 48 hours of timestamps and usage percentages in macOS
-`UserDefaults`. The app starts the locally installed Codex App Server, which
-communicates with OpenAI under the user's existing account and OpenAI terms.
-
-## Contributing
-
-Issues and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md)
-and [SECURITY.md](SECURITY.md).
-
-## License and trademark notice
-
-The source code in this repository is licensed under the [MIT License](LICENSE).
-
-This project is unofficial and is not affiliated with, endorsed by, or
-sponsored by OpenAI. Codex, ChatGPT, OpenAI, and related marks are trademarks of
-OpenAI. This project does not include OpenAI logos or bundle OpenAI software.
-Codex itself is available separately from OpenAI under the
-[Apache-2.0 License](https://github.com/openai/codex).
+MIT. See [LICENSE](LICENSE).
