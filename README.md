@@ -13,6 +13,16 @@ X 60% A 35%|66%
 - **X**: Codex weekly remaining
 - **A**: Claude 5-hour remaining | Claude weekly remaining
 
+Codex shows `0%!` when the weekly quota is exhausted, `…` while loading, `!` after a read
+failure, `?` for stale data, and `—` when no weekly limit is available. The dashboard explains
+the state and uses the same local reset-date layout for both providers, such as `Sat 17 OCT 14:30`.
+Confirmed Codex exhaustion displays a red `!` inside the weekly quota circle; loading, unavailable,
+stale and failed readings never use that icon. A daily average rounded to zero stays numeric.
+Failed or expired readings retain the
+last known value as a labelled note, rather than presenting it as current quota. A passed reset
+never implies a new balance until Codex returns a fresh reading. Requests time out after 20 seconds
+so Refresh can retry; errors show fixed messages and codes without storing server output.
+
 Click it for a dashboard with rings, reset times, your plans, and a green **Daily avg** ring
 (weekly remaining ÷ days until reset, at least one day). The dashboard can also be pinned to the desktop.
 

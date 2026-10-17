@@ -1,19 +1,24 @@
 import AppKit
+import CoreFoundation
 import Foundation
 import SwiftUI
 
 private enum CodexError: LocalizedError {
     case codexNotFound
-    case serverStopped
+    case serverStopped(Int32)
     case invalidResponse
-    case server(String)
+    case requestTimedOut
+    case authenticationRequired
+    case server(Int)
 
     var errorDescription: String? {
         switch self {
         case .codexNotFound: return "Codex CLI not found. Install the ChatGPT or Codex app."
-        case .serverStopped: return "Connection to Codex App Server ended."
+        case .serverStopped(let status): return "Codex connection ended (exit \(status)). Try Refresh."
         case .invalidResponse: return "Codex returned an invalid response."
-        case .server(let message): return message
+        case .requestTimedOut: return "Codex did not respond within 20 seconds. Try Refresh."
+        case .authenticationRequired: return "Codex sign-in is unavailable. Check sign-in in the Codex app."
+        case .server(let code): return "Codex usage request failed (code \(code)). Try Refresh."
         }
     }
 }
@@ -24,29 +29,35 @@ struct LimitWindow {
     let durationMinutes: Int?
 
     init?(json: [String: Any]?) {
-        guard let json, let usedPercent = json["usedPercent"] as? Int else { return nil }
+        guard let json, let usedPercent = json["usedPercent"] as? Int,
+              let number = json["usedPercent"] as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID(), usedPercent >= 0 else { return nil }
         self.usedPercent = usedPercent
         resetsAt = (json["resetsAt"] as? Int).map { Date(timeIntervalSince1970: TimeInterval($0)) }
         durationMinutes = json["windowDurationMins"] as? Int
     }
 
-    var remainingPercent: Int { max(0, min(100, 100 - usedPercent)) }
-    var isWeekly: Bool { (durationMinutes ?? 0) >= 1_440 }
+    var remainingPercent: Int { 100 - min(100, usedPercent) }
+    var isWeekly: Bool { durationMinutes == 10_080 }
 }
 
 struct UsageSnapshot {
     let weekly: LimitWindow?
     let planType: String?
-    let updatedAt = Date()
+    let updatedAt: Date
 
-    init(result: [String: Any]) throws {
-        guard let rateLimits = result["rateLimits"] as? [String: Any] else {
+    init(result: [String: Any], updatedAt: Date = Date()) throws {
+        let byID = result["rateLimitsByLimitId"] as? [String: Any]
+        let legacy = result["rateLimits"] as? [String: Any]
+        guard let rateLimits = (byID?["codex"] as? [String: Any]) ?? legacy,
+              rateLimits["limitId"] as? String == nil || rateLimits["limitId"] as? String == "codex" else {
             throw CodexError.invalidResponse
         }
         let windows = [rateLimits["primary"], rateLimits["secondary"]]
             .compactMap { LimitWindow(json: $0 as? [String: Any]) }
         weekly = windows.first(where: \.isWeekly)
         planType = rateLimits["planType"] as? String
+        self.updatedAt = updatedAt
     }
 
     /// App-server plan ids are internal names; map the known ones to what the subscription page shows.
@@ -78,6 +89,14 @@ private final class CodexAppServerClient {
     private var state: State = .stopped
     private var callbacks: [Int: (Result<[String: Any], Error>) -> Void] = [:]
     private var pendingUsageRequests: [Completion] = []
+    private var timeouts: [Int: DispatchWorkItem] = [:]
+    private let requestTimeout: TimeInterval
+    private let executableOverride: URL?
+
+    init(requestTimeout: TimeInterval = 20, executable: URL? = nil) {
+        self.requestTimeout = requestTimeout
+        executableOverride = executable
+    }
 
     func fetchUsage(completion: @escaping Completion) {
         queue.async {
@@ -95,21 +114,14 @@ private final class CodexAppServerClient {
 
     func stop() {
         queue.sync {
-            self.outputPipe?.fileHandleForReading.readabilityHandler = nil
-            self.process?.terminationHandler = nil
-            if self.process?.isRunning == true {
-                self.process?.terminate()
-                self.process?.waitUntilExit()
-            }
-            self.process = nil
-            self.inputPipe = nil
-            self.outputPipe = nil
-            self.state = .stopped
+            self.resetServer()
+            self.callbacks.removeAll()
+            self.pendingUsageRequests.removeAll()
         }
     }
 
     private func startServer() {
-        guard let executable = Self.findCodexExecutable() else {
+        guard let executable = executableOverride ?? Self.findCodexExecutable() else {
             failAll(with: CodexError.codexNotFound)
             return
         }
@@ -123,13 +135,19 @@ private final class CodexAppServerClient {
         process.standardOutput = outputPipe
         process.standardError = FileHandle.nullDevice
 
-        outputPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+        outputPipe.fileHandleForReading.readabilityHandler = { [weak self, weak process] handle in
             let data = handle.availableData
-            guard !data.isEmpty else { return }
-            self?.queue.async { self?.consume(data) }
+            guard !data.isEmpty, let process else { return }
+            self?.queue.async {
+                guard self?.process === process else { return }
+                self?.consume(data)
+            }
         }
-        process.terminationHandler = { [weak self] _ in
-            self?.queue.async { self?.handleTermination() }
+        process.terminationHandler = { [weak self] terminated in
+            self?.queue.async {
+                guard self?.process === terminated else { return }
+                self?.failAll(with: CodexError.serverStopped(terminated.terminationStatus))
+            }
         }
 
         do {
@@ -140,7 +158,7 @@ private final class CodexAppServerClient {
             self.state = .initializing
             sendRequest(
                 method: "initialize",
-                params: ["clientInfo": ["name": "usage-bar", "title": "Usage Bar", "version": "2.0.0"]]
+                params: ["clientInfo": ["name": "usage-bar", "title": "Usage Bar", "version": "2.0.2"]]
             ) { result in
                 switch result {
                 case .success:
@@ -172,6 +190,12 @@ private final class CodexAppServerClient {
         let id = nextRequestID
         nextRequestID += 1
         callbacks[id] = completion
+        let timeout = DispatchWorkItem { [weak self] in
+            guard self?.callbacks[id] != nil else { return }
+            self?.failAll(with: CodexError.requestTimedOut)
+        }
+        timeouts[id] = timeout
+        queue.asyncAfter(deadline: .now() + requestTimeout, execute: timeout)
         var payload: [String: Any] = ["id": id, "method": method]
         if let params { payload["params"] = params }
         writeJSON(payload)
@@ -201,9 +225,15 @@ private final class CodexAppServerClient {
                   let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
                   let id = object["id"] as? Int,
                   let callback = callbacks.removeValue(forKey: id) else { continue }
+            timeouts.removeValue(forKey: id)?.cancel()
 
             if let errorObject = object["error"] as? [String: Any] {
-                callback(.failure(CodexError.server(errorObject["message"] as? String ?? "Codex App Server error")))
+                // Show a fixed diagnosis and code, never arbitrary server text or credentials.
+                let message = (errorObject["message"] as? String ?? "").lowercased()
+                let authError = ["not logged in", "not authenticated", "unauthorized", "sign in", "authentication"]
+                    .contains(where: message.contains)
+                callback(.failure(authError ? CodexError.authenticationRequired
+                                  : CodexError.server(errorObject["code"] as? Int ?? -1)))
             } else if let result = object["result"] as? [String: Any] {
                 callback(.success(result))
             } else {
@@ -212,21 +242,25 @@ private final class CodexAppServerClient {
         }
     }
 
-    private func handleTermination() {
-        guard state != .stopped else { return }
+    private func resetServer() {
+        timeouts.values.forEach { $0.cancel() }
+        timeouts.removeAll()
+        outputPipe?.fileHandleForReading.readabilityHandler = nil
+        process?.terminationHandler = nil
+        if process?.isRunning == true { process?.terminate() }
         process = nil
         inputPipe = nil
         outputPipe = nil
+        buffer.removeAll()
         state = .stopped
-        failAll(with: CodexError.serverStopped)
     }
 
     private func failAll(with error: Error) {
-        let requestCallbacks = callbacks.values
+        let requestCallbacks = Array(callbacks.values)
         callbacks.removeAll()
         let usageCallbacks = pendingUsageRequests
         pendingUsageRequests.removeAll()
-        state = .stopped
+        resetServer()
         requestCallbacks.forEach { $0(.failure(error)) }
         usageCallbacks.forEach { $0(.failure(error)) }
     }
@@ -369,8 +403,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func updateDisplay() {
-        statusItem.button?.title = combinedStatusTitle(codex: snapshot, claude: claudeSnapshot)
-        statusItem.button?.toolTip = "Remaining: X Codex weekly · A Claude 5-hour | weekly"
+        let codexDisplay = CodexUsagePresentation(snapshot: snapshot, error: errorMessage, refreshing: codexRefreshing)
+        statusItem.button?.title = combinedStatusTitle(codex: snapshot, claude: claudeSnapshot,
+                                                       codexError: errorMessage, refreshing: codexRefreshing)
+        statusItem.button?.toolTip = "Codex: \(codexDisplay.message) \(codexResetDescription(codexDisplay.reset))"
+            + "\nA: Claude 5-hour | weekly remaining"
         let dashboard = UsageDashboard(
             codex: snapshot,
             claude: claudeSnapshot,
@@ -536,11 +573,29 @@ private enum UsageBarApp {
 
     private static func renderPreview(to url: URL) -> Never {
         _ = NSApplication.shared
-        let (codex, claude) = try! sampleData()
+        let (sample, claude) = try! sampleData()
+        var codex: UsageSnapshot? = sample
+        var error: String?
+        var refreshing = false
+        if let index = CommandLine.arguments.firstIndex(of: "--codex-preview"),
+           CommandLine.arguments.indices.contains(index + 1) {
+            let scenario = CommandLine.arguments[index + 1]
+            let now = Date()
+            let reset = now.addingTimeInterval(scenario == "reset-passed" ? -60 : 3 * 86_400)
+            let result: [String: Any] = ["rateLimits": ["primary": [
+                "usedPercent": scenario == "available" ? 40 : (scenario == "low" ? 99 : 100), "windowDurationMins": 10_080,
+                "resetsAt": Int(reset.timeIntervalSince1970)
+            ], "planType": "prolite"]]
+            codex = try! UsageSnapshot(result: result,
+                                       updatedAt: scenario == "stale" ? now.addingTimeInterval(-600) : now)
+            if scenario == "error" { error = CodexError.requestTimedOut.localizedDescription }
+            if scenario == "unavailable" { codex = try! UsageSnapshot(result: ["rateLimits": [:]]) }
+            if scenario == "loading" { codex = nil; refreshing = true }
+        }
         let pinned = CommandLine.arguments.contains("--pinned")
         let view = NSHostingView(rootView: UsageDashboard(
-            codex: codex, claude: claude, codexError: nil, claudeError: nil,
-            refreshing: false, pinned: pinned, onRefresh: {}, onQuit: {}
+            codex: codex, claude: claude, codexError: error, claudeError: nil,
+            refreshing: refreshing, pinned: pinned, onRefresh: {}, onQuit: {}
         ).background(pinned ? Color(white: 0.22) : .clear))
         view.frame.size = view.fittingSize
         let window = NSWindow(contentRect: view.frame, styleMask: .borderless, backing: .buffered, defer: false)
@@ -554,6 +609,7 @@ private enum UsageBarApp {
 
     private static func runParsingTest() -> Never {
         do {
+            try runCodexUsageTests()
             let (codex, claude) = try sampleData()
             precondition(combinedStatusTitle(codex: codex, claude: claude) == "X 60% A 35%|66%")
             precondition(combinedStatusTitle(codex: codex, claude: nil) == "X 60% A —|—")
@@ -603,5 +659,131 @@ private enum UsageBarApp {
             fputs("ERROR \(error.localizedDescription)\n", stderr)
             exit(1)
         }
+    }
+
+    private static func runCodexUsageTests() throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let reset = now.addingTimeInterval(3 * 86_400)
+        func window(_ used: Any, minutes: Int = 10_080) -> [String: Any] {
+            ["usedPercent": used, "windowDurationMins": minutes, "resetsAt": Int(reset.timeIntervalSince1970)]
+        }
+        func snapshot(_ weekly: [String: Any], updatedAt: Date? = nil) throws -> UsageSnapshot {
+            try UsageSnapshot(result: ["rateLimits": ["primary": weekly]], updatedAt: updatedAt ?? now)
+        }
+        func display(_ value: UsageSnapshot?, error: String? = nil, refreshing: Bool = false,
+                     at time: Date? = nil) -> CodexUsagePresentation {
+            CodexUsagePresentation(snapshot: value, error: error, refreshing: refreshing, now: time ?? now)
+        }
+        let exhausted = try snapshot(window(100))
+        let available = try snapshot(window(40))
+        precondition(display(exhausted).status == .exhausted && display(exhausted).remainingPercent == 0)
+        precondition(display(exhausted).message == "Weekly quota exhausted.")
+        precondition(combinedStatusTitle(codex: exhausted, claude: nil, now: now) == "X 0%! A —|—")
+        precondition(display(available).status == .available && display(available).remainingPercent == 60)
+        let full = try snapshot(window(0))
+        precondition(full.weekly?.remainingPercent == 100)
+        // Over-limit readings remain exhausted; clamp before subtracting to avoid integer overflow.
+        precondition(LimitWindow(json: window(Int.max))?.remainingPercent == 0)
+        precondition(LimitWindow(json: window(-1)) == nil)
+        for invalid in [NSNull(), "0", 0.5] as [Any] {
+            let value = try snapshot(window(invalid))
+            precondition(value.weekly == nil)
+        }
+        let boolean = try JSONSerialization.jsonObject(with: Data("{\"usedPercent\":true,\"windowDurationMins\":10080}".utf8)) as! [String: Any]
+        precondition(LimitWindow(json: boolean) == nil)
+        let missingPercent = try snapshot(["windowDurationMins": 10_080])
+        let dailyOnly = try snapshot(window(40, minutes: 1_440))
+        precondition(display(missingPercent).status == .unavailable)
+        precondition(display(dailyOnly).status == .unavailable)
+        precondition(display(nil).status == .unavailable && display(nil).remainingPercent == nil)
+        precondition(display(nil, refreshing: true).status == .loading)
+        precondition(display(available, refreshing: true).remainingPercent == 60)
+        let failed = display(exhausted, error: "test failure")
+        precondition(failed.status == .failed && failed.remainingPercent == nil && failed.menuText == "!")
+        precondition(exhausted.weekly?.remainingPercent == 0) // A read failure does not replace the snapshot.
+        precondition(display(exhausted, at: now.addingTimeInterval(300)).status == .stale)
+        let resetPassed = try snapshot(window(100), updatedAt: reset)
+        precondition(display(resetPassed, at: reset).status == .stale)
+        precondition(display(resetPassed, at: reset).remainingPercent == nil)
+        let noReset = try snapshot(["usedPercent": 40, "windowDurationMins": 10_080])
+        precondition(display(noReset).remainingPercent == 60 && display(noReset).reset == nil)
+        precondition(dailyAverageRemaining(remaining: 60, resetsAt: noReset.weekly?.resetsAt) == nil)
+        precondition(codexResetDescription(nil) == "Reset time unavailable")
+        let utc = TimeZone(secondsFromGMT: 0)!
+        precondition(codexResetDescription(reset, now: now, timeZone: utc) == "Resets Mon 18 JAN 08:00")
+        precondition(codexResetDescription(reset, now: reset, timeZone: utc) == "Previous reset Mon 18 JAN 08:00")
+        let sydney = TimeZone(identifier: "Australia/Sydney")!
+        let localReset = ISO8601DateFormatter().date(from: "2026-10-17T03:30:00Z")!
+        precondition(UsageDashboard.resetText(localReset, timeZone: sydney) == "Sat 17 OCT 14:30")
+        precondition(UsageDashboard.resetText(localReset, timeZone: utc) == "Sat 17 OCT 03:30")
+        let midnight = ISO8601DateFormatter().date(from: "2026-10-16T13:00:00Z")!
+        precondition(UsageDashboard.resetText(midnight, timeZone: sydney) == "Sat 17 OCT 00:00")
+        precondition(UsageDashboard.resetText(midnight, timeZone: utc) == "Fri 16 OCT 13:00")
+        let low = try snapshot(window(99))
+        precondition(display(low).status == .available && display(low).remainingPercent == 1)
+        precondition(dailyAverageRemaining(remaining: 1, resetsAt: reset, now: now) == 0)
+        for (primary, secondary) in [(window(80, minutes: 300), window(40)), (window(40), window(80, minutes: 300))] {
+            let value = try UsageSnapshot(result: ["rateLimits": ["primary": primary, "secondary": secondary]], updatedAt: now)
+            precondition(value.weekly?.remainingPercent == 60)
+        }
+        let mapped = try UsageSnapshot(result: [
+            "rateLimits": ["primary": window(100)],
+            "rateLimitsByLimitId": ["other": ["primary": window(100)], "codex": ["primary": window(40)]]
+        ], updatedAt: now)
+        precondition(mapped.weekly?.remainingPercent == 60)
+        for missing in [[:], ["rateLimits": NSNull()],
+                        ["rateLimits": ["limitId": "other", "primary": window(100)]],
+                        ["rateLimitsByLimitId": ["other": ["primary": window(100)]]]] as [[String: Any]] {
+            do { _ = try UsageSnapshot(result: missing); preconditionFailure("Expected invalid response") }
+            catch CodexError.invalidResponse { }
+        }
+
+        // Exercise a real pipe/process timeout, stale partial bytes, sanitized error and recovery.
+        // The fixture is local and never starts Codex or reads any account data.
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("usage-bar-test-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fixture = directory.appendingPathComponent("fixture.sh")
+        try "#!/bin/sh\nprintf '{\"id\":'\nwhile IFS= read -r line; do :; done\n".write(to: fixture, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: fixture.path)
+        let client = CodexAppServerClient(requestTimeout: 0.5, executable: fixture)
+        defer { client.stop() }
+        func fetch() -> Result<UsageSnapshot, Error> {
+            let done = DispatchSemaphore(value: 0)
+            var result: Result<UsageSnapshot, Error>?
+            client.fetchUsage { result = $0; done.signal() }
+            precondition(done.wait(timeout: .now() + 5) == .success, "Client callback did not finish")
+            return result!
+        }
+        guard case .failure(let timeout) = fetch(), case CodexError.requestTimedOut = timeout else {
+            preconditionFailure("Expected timeout")
+        }
+        let script = #"""
+        #!/bin/sh
+        failed=0
+        while IFS= read -r line; do
+          id=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+          case "$line" in
+            *'"method":"initialize"'*) printf '{"id":%s,"result":{}}\n' "$id" ;;
+            *'rateLimits'*)
+              if [ "$failed" = 0 ]; then
+                printf '{"id":%s,"error":{"code":401,"message":"unauthorized test-private-marker"}}\n' "$id"
+                failed=1
+              else
+                printf '{"id":%s,"result":{"rateLimits":{"primary":{"usedPercent":100,"windowDurationMins":10080}}}}\n' "$id"
+              fi ;;
+          esac
+        done
+        """#
+        try script.write(to: fixture, atomically: false, encoding: .utf8)
+        guard case .failure(let failure) = fetch() else { preconditionFailure("Expected read error") }
+        precondition(!failure.localizedDescription.contains("test-private-marker"))
+        guard case CodexError.authenticationRequired = failure else {
+            preconditionFailure("Expected sign-in diagnosis: \(failure.localizedDescription)")
+        }
+        let recovered = try fetch().get()
+        precondition(recovered.weekly?.remainingPercent == 0)
+        precondition(display(recovered, at: recovered.updatedAt).status == .exhausted)
+        print("OK Codex: zero/nonzero, loading/error/unavailable/stale, correct weekly pool, reset labels, timeout and retry")
     }
 }

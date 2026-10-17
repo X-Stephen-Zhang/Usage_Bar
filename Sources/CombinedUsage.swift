@@ -1,9 +1,63 @@
 import Foundation
 import SwiftUI
 
-func combinedStatusTitle(codex: UsageSnapshot?, claude: ClaudeUsageSnapshot?) -> String {
+struct CodexUsagePresentation {
+    enum Status { case loading, unavailable, available, exhausted, stale, failed }
+    let status: Status
+    let remainingPercent: Int?
+    let reset: Date?
+
+    init(snapshot: UsageSnapshot?, error: String?, refreshing: Bool, now: Date = Date()) {
+        reset = snapshot?.weekly?.resetsAt
+        if error != nil {
+            status = .failed
+        } else if let snapshot, let weekly = snapshot.weekly {
+            // Polling runs every two minutes. Missed polls and passed resets need a fresh reading.
+            if now.timeIntervalSince(snapshot.updatedAt) >= 300 || reset.map({ $0 <= now }) == true {
+                status = .stale
+            } else {
+                status = weekly.remainingPercent == 0 ? .exhausted : .available
+            }
+        } else {
+            status = refreshing ? .loading : .unavailable
+        }
+        remainingPercent = (status == .available || status == .exhausted)
+            ? snapshot?.weekly?.remainingPercent : nil
+    }
+
+    var menuText: String {
+        switch status {
+        case .loading: return "…"
+        case .failed: return "!"
+        case .stale: return "?"
+        case .unavailable: return "—"
+        case .exhausted: return "0%!"
+        case .available: return "\(remainingPercent!)%"
+        }
+    }
+
+    var message: String {
+        switch status {
+        case .loading: return "Loading Codex usage…"
+        case .failed: return "Unable to read current usage."
+        case .stale: return "Usage data is out of date. Waiting for a fresh reading."
+        case .unavailable: return "Weekly limit unavailable."
+        case .exhausted: return "Weekly quota exhausted."
+        case .available: return "Weekly quota remaining."
+        }
+    }
+}
+
+func codexResetDescription(_ reset: Date?, now: Date = Date(), timeZone: TimeZone = .current) -> String {
+    guard let reset else { return "Reset time unavailable" }
+    return "\(reset <= now ? "Previous reset" : "Resets") \(UsageDashboard.resetText(reset, timeZone: timeZone))"
+}
+
+func combinedStatusTitle(codex: UsageSnapshot?, claude: ClaudeUsageSnapshot?,
+                         codexError: String? = nil, refreshing: Bool = false, now: Date = Date()) -> String {
     func percent(_ value: Int?) -> String { value.map { "\($0)%" } ?? "—" }
-    return "X \(percent(codex?.weekly?.remainingPercent)) A "
+    let display = CodexUsagePresentation(snapshot: codex, error: codexError, refreshing: refreshing, now: now)
+    return "X \(display.menuText) A "
         + "\(percent(claude?.fiveHour?.remainingPercent))|\(percent(claude?.weekly?.remainingPercent))"
 }
 
@@ -33,7 +87,20 @@ struct UsageDashboard: View {
     private static let dayStyle = Date.FormatStyle(locale: Locale(identifier: "en_GB"))
         .weekday(.abbreviated).day().month(.abbreviated)
 
+    /// Both providers use Claude's compact local-time layout, with an uppercase month.
+    static func resetText(_ date: Date, timeZone: TimeZone = .current) -> String {
+        var day = dayStyle
+        var time = timeStyle
+        day.timeZone = timeZone
+        time.timeZone = timeZone
+        let month = date.formatted(Date.FormatStyle(locale: Locale(identifier: "en_GB"), timeZone: timeZone)
+            .month(.abbreviated))
+        let dateText = date.formatted(day).replacingOccurrences(of: month, with: month.uppercased())
+        return "\(dateText) \(date.formatted(time))"
+    }
+
     var body: some View {
+        let codexDisplay = CodexUsagePresentation(snapshot: codex, error: codexError, refreshing: refreshing)
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 10) {
                 VStack(alignment: .leading, spacing: 1) {
@@ -48,10 +115,19 @@ struct UsageDashboard: View {
                            action: onTogglePin)
                 iconButton("power", help: "Quit", action: onQuit)
             }
-            card(name: "Codex", plan: codex?.planLabel, color: .blue, note: nil, error: codexError) {
-                quota(label: "Weekly", remaining: codex?.weekly?.remainingPercent,
-                      reset: codex?.weekly?.resetsAt, color: .blue)
-                daily(remaining: codex?.weekly?.remainingPercent, reset: codex?.weekly?.resetsAt)
+            card(name: "Codex", plan: codex?.planLabel, color: .blue,
+                 note: codex.map { "as of " + asOf($0.updatedAt) }, error: codexError,
+                 status: codexDisplay.message
+                    + ((codexDisplay.status == .failed || codexDisplay.status == .stale)
+                       ? codex?.weekly.map { "\nLast known remaining: \($0.remainingPercent)%" } ?? "" : "")) {
+                column(ring: ring(codexDisplay.remainingPercent, color: .blue, size: 66, lineWidth: 7, fontSize: 20,
+                                  exhausted: codexDisplay.status == .exhausted),
+                       label: "Weekly", detail: codexDisplay.remainingPercent != nil
+                        ? codexDisplay.reset.map { Self.resetText($0) } ?? "Reset unavailable"
+                        : (codexDisplay.status == .loading ? "Loading…" : "Unavailable"))
+                    .help(codexResetDescription(codexDisplay.reset))
+                daily(remaining: codexDisplay.remainingPercent,
+                      reset: codexDisplay.remainingPercent == nil ? nil : codexDisplay.reset)
             }
             card(name: "Claude", plan: claudePlan, color: .orange,
                  note: claude.map { "as of " + asOf($0.updatedAt) }, error: claudeError) {
@@ -97,7 +173,7 @@ struct UsageDashboard: View {
     }
 
     private func card<Content: View>(
-        name: String, plan: String?, color: Color, note: String?, error: String?,
+        name: String, plan: String?, color: Color, note: String?, error: String?, status: String? = nil,
         @ViewBuilder content: () -> Content
     ) -> some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -117,6 +193,10 @@ struct UsageDashboard: View {
                 }
             }
             HStack(alignment: .top, spacing: 0) { content() }
+            if let status {
+                Text(status).font(.caption2).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             if let error {
                 Label(error, systemImage: "exclamationmark.triangle.fill")
                     .font(.caption2).foregroundStyle(.secondary)
@@ -128,7 +208,8 @@ struct UsageDashboard: View {
         .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Color.primary.opacity(0.05)))
     }
 
-    private func ring(_ value: Int?, color: Color, size: CGFloat, lineWidth: CGFloat, fontSize: CGFloat) -> some View {
+    private func ring(_ value: Int?, color: Color, size: CGFloat, lineWidth: CGFloat, fontSize: CGFloat,
+                      exhausted: Bool = false) -> some View {
         ZStack {
             Circle().stroke(color.opacity(0.16), lineWidth: lineWidth)
             if let value {
@@ -136,15 +217,22 @@ struct UsageDashboard: View {
                     .stroke(color, style: StrokeStyle(lineWidth: lineWidth, lineCap: .round))
                     .rotationEffect(.degrees(-90))
             }
-            HStack(alignment: .firstTextBaseline, spacing: 0) {
-                Text(value.map(String.init) ?? "—")
-                    .font(.system(size: fontSize, weight: .semibold, design: .rounded))
-                if value != nil {
-                    Text("%").font(.system(size: fontSize * 0.55, weight: .semibold, design: .rounded))
-                        .foregroundStyle(.secondary)
+            if exhausted {
+                Text("!")
+                    .font(.system(size: fontSize * 1.6, weight: .bold, design: .rounded))
+                    .foregroundStyle(.red)
+                    .accessibilityLabel("Quota exhausted")
+            } else {
+                HStack(alignment: .firstTextBaseline, spacing: 0) {
+                    Text(value.map(String.init) ?? "—")
+                        .font(.system(size: fontSize, weight: .semibold, design: .rounded))
+                    if value != nil {
+                        Text("%").font(.system(size: fontSize * 0.55, weight: .semibold, design: .rounded))
+                            .foregroundStyle(.secondary)
+                    }
                 }
+                .monospacedDigit()
             }
-            .monospacedDigit()
         }
         .frame(width: size, height: size)
     }
@@ -165,10 +253,10 @@ struct UsageDashboard: View {
         column(
             ring: ring(remaining, color: color, size: 66, lineWidth: 7, fontSize: 20),
             label: label,
-            detail: reset.map { "\($0.formatted(Self.dayStyle)) \($0.formatted(Self.timeStyle))" }
+            detail: reset.map { Self.resetText($0) }
                 ?? (remaining == nil ? "Waiting for data" : "Window reset")
         )
-        .help(reset.map { "Resets \($0.formatted(Self.dayStyle)) \($0.formatted(Self.timeStyle))" } ?? "")
+        .help(reset.map { "Resets \(Self.resetText($0))" } ?? "")
     }
 
     private func daily(remaining: Int?, reset: Date?) -> some View {
